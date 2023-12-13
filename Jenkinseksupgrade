@@ -1,0 +1,210 @@
+def varFileName="${params.varFileName}"
+def key="${params.key}"
+def bucket="${params.Bucket}"
+def planPath="${params.planPath}"
+def clustername="${params.EKSClusterName}"
+def region="${params.Region}"
+def ami_id="${params.AMI}"
+def upgrade_strategy="${params.Upgrade_Strategy}"
+def max_unavailable="${params.Max_Unavailable}"
+def nodegroup="${params.NodeGroup}"
+def grafanaurl = ''
+
+pipeline {
+  agent {
+      kubernetes {
+          label "eks-workerplane-upgrade"
+          yaml """
+    apiVersion: v1
+    kind: Pod
+    spec:
+      serviceAccount: ${clustername}-sa
+      containers:
+        - name: terraform
+          image: 
+          command: ["sleep"]
+          args: ["36000"]
+          resources:
+            limits:
+              cpu: "3"
+              memory: 6000Mi
+            requests:
+              cpu: 500m
+              memory: 4000Mi  
+        """
+                }
+            }
+  stages {
+    stage('Checkout'){
+      steps {
+        container('terraform') {
+         checkout([$class: 'GitSCM', 
+                  branches: [[name: "master"]],
+                  extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: '<targetdirectory>']], 
+                  userRemoteConfigs: [[credentialsId: "creds", url: "<any other bitbucket url that needs to be cloned>"]]])
+        }
+      }
+    }
+    stage('Pre Upgrade Check') { 
+      steps {
+        container('terraform') {
+         sh """
+          apk update
+          apk add --no-cache curl bash jq util-linux
+         """
+         sh """
+          curl -Lo aws-iam-authenticator https://github.com/kubernetes-sigs/aws-iam-authenticator/releases/download/v0.5.9/aws-iam-authenticator_0.5.9_linux_amd64
+          chmod +x ./aws-iam-authenticator
+          mv ./aws-iam-authenticator /usr/local/bin/aws-iam-authenticator
+         """
+         sh """
+          curl -LO https://storage.googleapis.com/kubernetes-release/release/`curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt`/bin/\$(uname | awk '{print tolower(\$0)}')/amd64/kubectl
+          chmod +x ./kubectl
+          mv ./kubectl /usr/local/bin/kubectl
+         """
+         script {
+          if (clustername == '<clustername>') {
+           grafanaurl = '<url>'
+          } else if (clustername == '<clustername>') {
+           grafanaurl = '<url>'
+          } 
+         }
+         wrap([$class: 'BuildUser']) {
+          sh """
+           echo "Print something or send notification"
+          """
+         }
+         sh """
+          aws eks update-kubeconfig --name ${clustername} --region ${region}
+          ./pre-check-data.sh
+         """
+        }
+      }
+    }
+    stage('Terraform Init & Plan') {
+     steps {
+     container('terraform') {
+      sh "cd ${planPath} && terraform init  -backend-config='bucket=${bucket}' -backend-config='key=${key}' -backend-config='region=${region}'"
+      script {
+        if (nodegroup == 'all') {
+            sh """
+                cd ${planPath} && terraform  plan -var="ami_id=\\"${ami_id}\\"" -var="${upgrade_strategy}=${max_unavailable}" -var-file=tfvars/${varFileName}  -out workerplan
+               """
+        } else {
+            def nglist = nodegroup.split(',')
+            def finalNg = ""
+            for (arg in nglist) {
+               finalNg += " -target='<module>[\"${arg}\"]' -target='<module>[\"${arg}\"]'"
+            }
+            sh """
+              cd ${planPath} && terraform plan ${finalNg} -var="ami_id=\\"${ami_id}\\"" -var="${upgrade_strategy}=${max_unavailable}" -var-file=tfvars/${varFileName} -out workerplan
+            """
+        }
+      }
+      }
+     }
+    }
+    stage('Approval') {
+     steps {
+      script {
+       try {
+        def userInput = input(id: 'proceed', message: 'Apply Terraform?', submitter: "<emailids comma seperated>", parameters: [
+        [$class: 'BooleanParameterDefinition', defaultValue: false, description: 'Apply terraform? Make sure you reviewed the Plan', name: 'proceed']
+        ])
+       if (userInput) {
+       container('terraform') {
+        wrap([$class: 'BuildUser']) {
+          sh """
+           echo "Print something or send notification"
+          """
+         } 
+        }
+        env.PROCEED = 'true'
+        }
+       } catch (Exception e) {
+          container('terraform') {
+           wrap([$class: 'BuildUser']) {
+           sh """
+           echo "Print something or send notification"
+          """
+         } 
+        }
+        currentBuild.result = 'FAILURE'
+        env.PROCEED = 'false'
+        }
+      }
+     }
+    }
+    stage('Terraform Apply') {
+      when {
+                expression { env.PROCEED == 'true' }
+      }
+      steps {
+        container('terraform') {
+          sh "cd ${planPath} && terraform apply  -input=false workerplan"
+        }
+      }
+    }
+    stage('Push to bitbucket') {
+        when {
+                expression { env.PROCEED == 'true' }
+        }
+        steps {
+          script {
+          wrap([$class: 'BuildUser']) {
+            sh """
+                 git config --global user.email "jenkins@example.com"
+                 git config --global user.name "EKSUpgradeUser"
+                 git config --global push.default current
+              """
+             sshagent(['bitbucket']) {
+               sh """
+                mydate=`date +"%d-%m-%Y_%H-%M-%S"`
+                cd <directory>
+                git checkout master
+                echo "${clustername} is Upgraded with Changes AMI: ${ami_id}, ${upgrade_strategy}: ${max_unavailable}, NodeGroup: ${nodegroup}" > ${clustername}/Workerplane-"\$mydate"
+                git add .
+                git commit -m "Automated: Changes made in Cluster: ${clustername},Pipeline Triggered By ${BUILD_USER}, EmailID: ${BUILD_USER_EMAIL}"
+                git push origin master
+               """
+             }
+          }
+          }
+        }
+    }
+    stage('Post Upgrade Check') {
+      when {
+                expression { env.PROCEED == 'true' }
+      }
+      steps {
+        container('terraform') {
+          sh """
+            aws eks update-kubeconfig --name ${clustername} --region ${region}
+            ./post-check-data.sh
+          """
+        }
+      }   
+    }
+  }
+  post {
+  
+    failure  {
+      container('terraform') {
+       wrap([$class: 'BuildUser']) {
+        sh """
+         echo "Print something or send notification"
+        """
+       }
+      }
+    }
+    success  {
+      wrap([$class: 'BuildUser']) {
+      container('terraform') {
+        sh """
+           echo "Print something or send notification"
+         """
+      }
+      }
+    }
+   }
+}
